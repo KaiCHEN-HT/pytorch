@@ -52,11 +52,9 @@ class AOTInductorModelContainer {
       output_names_.emplace_back(model->output_name(static_cast<int64_t>(i)));
     }
     model->load_constants();
-#if defined(USE_CUDA) || defined(USE_XPU)
     constant_blob_ = model->release_constant_blob();
     constants_internal_offset_.resize(model->num_constants());
-    model->compute_gpu_constant_blob(blob_size_, constants_internal_offset_);
-#endif
+    model->compute_constant_blob(blob_size_, constants_internal_offset_);
 
     for (auto& model : models_) {
       model->update_constants_map(constants_map_);
@@ -275,7 +273,6 @@ class AOTInductorModelContainer {
         continue;
       }
 
-#if defined(USE_CUDA) || defined(USE_XPU)
       AtenTensorHandle tensor;
       if (_should_skip_update(idx) && use_inactive) {
         tensor = original_constants_map->find(constant_name)->second.get();
@@ -298,13 +295,14 @@ class AOTInductorModelContainer {
       queue_ptr
           ->memcpy(internal_constants_ptr, user_constant_ptr, constant_size)
           .wait();
-
-#else
+#elif USE_CUDA
       AOTI_RUNTIME_DEVICE_CHECK(cudaMemcpy(
           internal_constants_ptr,
           user_constant_ptr,
           constant_size,
           cudaMemcpyDefault));
+#else
+      memcpy(internal_constants_ptr, user_constant_ptr, constant_size);
 #endif
       // Generate Tensor from container handled blob.
       // We extract stride and offset from provided Tensor since we do not
@@ -313,6 +311,7 @@ class AOTInductorModelContainer {
       int64_t* stride;
       int64_t offset;
       int device_idx = models_[0]->get_device_idx();
+      int device_type = models_[0]->get_device_type();
       AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_get_strides(tensor, &stride));
       AOTI_TORCH_ERROR_CODE_CHECK(
           aoti_torch_get_storage_offset(tensor, &offset));
@@ -323,20 +322,13 @@ class AOTInductorModelContainer {
           stride,
           offset,
           models_[0]->constant_dtype(idx),
-#ifdef USE_XPU
-          aoti_torch_device_type_xpu(),
-#else
-          aoti_torch_device_type_cuda(),
-#endif
+          device_type,
           device_idx,
           &tensor_handle));
-#else // USE_CUDA
-      AtenTensorHandle tensor_handle = it->second;
-#endif // USE_CUDA
 
       // Now place the tensor to constants_map. Note at this point the ownership
       // of the tensor_handle will be taken over.
-      constants_map_to_update->emplace(constant_name, tensor_handle);
+      constants_map_to_update->insert_or_assign(constant_name, tensor_handle);
     }
     // Update the inactive constant array.
     update_array_from_map(
@@ -411,12 +403,13 @@ class AOTInductorModelContainer {
   // Holds the blob storage for constants' at::Tensor for CUDA.
   GPUPtr constant_blob_;
   GPUPtr constant_blob_secondary_;
+#else
+  CPUPtr constant_blob_;
+  CPUPtr constant_blob_secondary_;
+#endif // USE_CUDA
 
-  // Let's place this within USE_CUDA at the moment before we fully support
-  // update for CPU cases.
   size_t blob_size_;
   std::vector<size_t> constants_internal_offset_;
-#endif // USE_CUDA
 
   // Determine which constants is being used for the model.
   // If true,
@@ -471,19 +464,21 @@ class AOTInductorModelContainer {
   // make sure no one is executing the model.
   std::shared_mutex model_exec_mutex_;
 
-#if defined(USE_CUDA) || defined(USE_XPU)
   void* get_constant_blob_ptr(bool get_inactive) {
     if ((get_inactive && use_secondary_) ||
         (!get_inactive && !use_secondary_)) {
       return constant_blob_.get();
     } else {
       if (!constant_blob_secondary_) {
+#if defined(USE_CUDA) || defined(USE_XPU)
         constant_blob_secondary_ = RAII_gpuMalloc(blob_size_);
+#else
+        constant_blob_secondary_ = RAII_cpuMalloc(blob_size_);
+#endif // USE_CUDA
       }
       return constant_blob_secondary_.get();
     }
   }
-#endif // USE_CUDA
 
   std::shared_ptr<ConstantMap> get_constants_map(bool get_inactive) {
     if ((get_inactive && use_secondary_) ||

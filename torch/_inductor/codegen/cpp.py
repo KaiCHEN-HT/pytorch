@@ -1869,6 +1869,9 @@ class CppKernel(Kernel):
         self.weight_recps_cse = CSE(
             self.newvar_prefix, self.suffix, name_prefix="wrecps"
         )
+        self.masked_weight_recps_cse = CSE(
+            self.newvar_prefix, self.suffix, name_prefix="masked_wrecps"
+        )
         self.preloads = IndentedBuffer()
         self.poststores = IndentedBuffer()
         self.num_threads = num_threads  # num_threads the kernel specialized for
@@ -2775,23 +2778,21 @@ class CppVecKernel(CppKernel):
         if reduction_type == "welford_reduce":
             # save the reciprocal of weights for welford reduce
             assert self.reduction_depth is not None
-            # use masked acc_vec for tail vec kernel
-            self.reduction_prefix_generators.append(
-                self._gen_reduction_prefix(
-                    masked_acc_vec,
-                    acc_type_vec,
-                    reduction_type,
-                    dtype,
-                    self.reduction_init_vec,
-                )
-            )
             reduction_size = functools.reduce(
                 lambda x, y: x * y, self.ranges[self.reduction_depth :]
             )
-            reduction_factor = (
-                self.tiling_factor if self.tiling_idx >= self.reduction_depth else 1
+            self.weight_recp_vec_range = (
+                FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                * FloorDiv(self.ranges[self.tiling_idx], self.tiling_factor)
+                if self.tiling_idx >= self.reduction_depth
+                else reduction_size
             )
-            self.weight_recp_vec_range = FloorDiv(reduction_size, reduction_factor)
+            self.masked_weight_recp_vec_range = (
+                FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                if self.tiling_idx >= self.reduction_depth
+                and self.ranges[self.tiling_idx] % self.tiling_factor
+                else 0
+            )
             if self.weight_recp_vec_range not in self.weight_recps_cse.reduction_cache:
                 self.weight_recps_val = self.weight_recps_cse.generate(
                     self.compute, f"reduction {self.weight_recp_vec_range}", write=False
@@ -2800,7 +2801,12 @@ class CppVecKernel(CppKernel):
                     self.weight_recp_vec_range
                 ] = self.weight_recps_val
                 self.non_parallel_reduction_prefix.writeline(
-                    self.welford_weight_reciprocal_vec(dtype)
+                    self.welford_weight_reciprocal_vec(
+                        dtype, self.weight_recp_vec_range, self.weight_recps_val
+                    )
+                )
+                self.non_parallel_reduction_prefix.writeline(
+                    f"{self.weight_recps_val}.clean_stack();"
                 )
                 # generate weight_recps for parallel reduction
                 num_threads = (
@@ -2809,12 +2815,78 @@ class CppVecKernel(CppKernel):
                     else parallel_num_threads()
                 )
                 self.local_reduction_init.writeline(
-                    self.welford_weight_reciprocal_vec(dtype, num_threads)
+                    self.welford_weight_reciprocal_vec(
+                        dtype,
+                        self.weight_recp_vec_range,
+                        self.weight_recps_val,
+                        num_threads,
+                    )
                 )
             else:
                 self.weight_recps_val = self.weight_recps_cse.reduction_cache[
                     self.weight_recp_vec_range
                 ]
+                self.non_parallel_reduction_prefix.writeline(
+                    f"{self.weight_recps_val}.clean_stack();"
+                )
+            if self.masked_weight_recp_vec_range:
+                # use masked acc_vec for tail vec kernel
+                self.reduction_prefix_generators.append(
+                    self._gen_reduction_prefix(
+                        masked_acc_vec,
+                        acc_type_vec,
+                        reduction_type,
+                        dtype,
+                        self.reduction_init_vec,
+                    )
+                )
+                if (
+                    self.masked_weight_recp_vec_range
+                    not in self.masked_weight_recps_cse.reduction_cache
+                ):
+                    self.masked_weight_recps_val = (
+                        self.masked_weight_recps_cse.generate(
+                            self.compute,
+                            f"reduction {self.weight_recp_vec_range}",
+                            write=False,
+                        )
+                    )
+                    self.weight_recps_cse.reduction_cache[
+                        self.masked_weight_recp_vec_range
+                    ] = self.masked_weight_recps_val
+                    self.non_parallel_reduction_prefix.writeline(
+                        self.welford_weight_reciprocal_vec(
+                            dtype,
+                            self.masked_weight_recp_vec_range,
+                            self.masked_weight_recps_val,
+                        )
+                    )
+                    self.non_parallel_reduction_prefix.writeline(
+                        f"{self.masked_weight_recps_val}.clean_stack();"
+                    )
+                    # generate weight_recps for parallel reduction
+                    num_threads = (
+                        "max_threads"
+                        if config.cpp.dynamic_threads
+                        else parallel_num_threads()
+                    )
+                    self.local_reduction_init.writeline(
+                        self.welford_weight_reciprocal_vec(
+                            dtype,
+                            self.masked_weight_recp_vec_range,
+                            self.masked_weight_recps_val,
+                            num_threads,
+                        )
+                    )
+                else:
+                    self.masked_weight_recps_val = (
+                        self.weight_recps_cse.reduction_cache[
+                            self.masked_weight_recp_vec_range
+                        ]
+                    )
+                    self.non_parallel_reduction_prefix.writeline(
+                        f"{self.masked_weight_recps_val}.clean_stack();"
+                    )
             # use masked acc_vec for tail vec kernel
             acc_vec_ = masked_acc_vec if self.tail_size else acc_vec
             self.stores.writeline(
@@ -2869,11 +2941,14 @@ class CppVecKernel(CppKernel):
                     1,
                     2,
                 ], "Welford reduction does not support VectorizedN (N>2)"
-                next_value = f"welford_vec_reduce_all({acc_vec})"
-                masked_next_value = f"welford_vec_reduce_all({masked_acc_vec})"
-                self.reduction_suffix.writeline(
-                    f"{acc} = {reduction_combine(reduction_type, acc, masked_next_value)};"
+                next_value = (
+                    f"welford_vec_reduce_all({acc_vec}, &{self.weight_recps_val})"
                 )
+                if self.masked_weight_recp_vec_range:
+                    masked_next_value = f"welford_vec_reduce_all({masked_acc_vec}, &{self.masked_weight_recps_val})"
+                    self.reduction_suffix.writeline(
+                        f"{acc} = {reduction_combine(reduction_type, acc, masked_next_value)};"
+                    )
             elif argmax_or_argmin:
                 next_value = f"{reduction_type}_vec_reduce_all({acc_vec})"
             elif is_bool:
@@ -3033,15 +3108,17 @@ class CppVecKernel(CppKernel):
             return f"{self._get_mask_type()}"
         return vec_type
 
-    def welford_weight_reciprocal_vec(self, dtype, num_threads=None):
+    def welford_weight_reciprocal_vec(
+        self, dtype, weight_recp_vec_range, weight_recps_val, num_threads=None
+    ):
         vec_num_range_thread = (
-            CeilDiv(self.weight_recp_vec_range, num_threads)
+            CeilDiv(weight_recp_vec_range, num_threads)
             if num_threads
-            else self.weight_recp_vec_range
+            else weight_recp_vec_range
         )
         vec_num_range_thread_expr = cexpr_index(vec_num_range_thread)
         return (
-            f"static WeightRecp<{self._get_vec_type(dtype)}> {self.weight_recps_val}"
+            f"static WeightRecp<{self._get_vec_type(dtype)}> {weight_recps_val}"
             f"("
             f"{vec_num_range_thread_expr}"
             f");"
@@ -3095,7 +3172,7 @@ class CppVecKernel(CppKernel):
         elif reduction_type == "welford_reduce":
             if use_weight_recps:
                 if self.tail_size:
-                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)}, &{self.weight_recps_val})"
+                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)}, &{self.masked_weight_recps_val})"
                 else:
                     return f"welford_combine({var}, {next_value}, &{self.weight_recps_val})"
             else:

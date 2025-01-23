@@ -444,6 +444,12 @@ class LocalGeneratorObjectVariable(VariableTracker):
             # exception is raised again.
             tracer.exception_handler(e)
 
+    def _is_inside_try_finally(self, tracer):
+        exn_tab_entry = tracer.current_instruction.exn_tab_entry
+        return (sys.version_info >= (3, 11) and exn_tab_entry) or (
+            sys.version_info < (3, 11) and tracer.block_stack
+        )
+
     def _is_generator_just_started(self):
         return self.inline_tracer is None or self.inline_tracer.instruction_pointer == 0
 
@@ -543,6 +549,35 @@ class LocalGeneratorObjectVariable(VariableTracker):
                 # https://github.com/python/cpython/pull/104771
                 assert tracer.symbolic_result is not None
                 return tracer.symbolic_result
+        elif name == "throw":
+            # * Raises an exception at the point where the generator was paused, and
+            # returns the next value yielded by the generator.
+            # * If the generator exits without yielding, raise StopIteration
+            # * If the generator function does not catch the passed-in exception,
+            # or raises a different exception, then that exception propagates to the caller.
+
+            # Setup the exception table and jump target in case of try...finally
+            tracer = self._get_inline_tracer(tx)
+            try:
+                self._setup_exception(tx, args[0])
+            except ObservedException:
+                # propagate the exception back to the parent caller
+                tx.exn_vt_stack.extend(tracer.exn_vt_stack)
+                raise
+
+            retval = self.next_variable(tx)
+
+            if self._is_inside_try_finally(tracer):
+                # Run the finally block and expect StopIteration from it.
+                # If it yields or raises anything else, we need to handle it.
+                try:
+                    r = self.next_variable(tx)
+                    if r:
+                        # msg: generator ignored GeneratorExit
+                        raise_observed_exception(RuntimeError, tracer)
+                except ObservedUserStopIteration:
+                    pass
+            return retval
 
         super().call_method(tx, name, args, kwargs)
 

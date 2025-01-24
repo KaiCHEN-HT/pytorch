@@ -14,12 +14,12 @@ import types
 import warnings
 import weakref
 from typing import Generic, TYPE_CHECKING
-from typing_extensions import is_typeddict
 
 import torch._dynamo.config
 import torch.nn
 from torch._guards import TracingContext
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass_type
+from typing_extensions import is_typeddict
 
 from .. import polyfills, variables
 from ..bytecode_transformation import create_call_function
@@ -677,6 +677,8 @@ def call_random_fn(tx, fn, args, kwargs):
     args = [x.as_python_constant() for x in args]
     kwargs = {k: v.as_python_constant() for k, v in kwargs.items()}
     random_call_index = len(tx.output.random_calls)
+    # NB: it is probably not important for the example_value to be exactly correct,
+    # we just need the right type
     example_value = fn(*args, **kwargs)
     source = RandomValueSource(random_call_index)
     tx.output.random_calls.append((fn, args, kwargs))
@@ -873,7 +875,12 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             and all(k.is_python_constant() for k in args)
             and all(v.is_python_constant() for v in kwargs.values())
         ):
-            return call_random_fn(tx, self.value, args, kwargs)
+            return call_random_fn(
+                tx,
+                self.value,
+                args,
+                kwargs,
+            )
         elif istype(self.value, types.MethodType):
             func = self.value.__func__
             obj = self.value.__self__
